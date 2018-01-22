@@ -5,6 +5,12 @@ date: "December 29, 2017"
 output: pdf_document
 ---
 
+#Summary
+
+This script takes in two csv files from an SQL dump and transforms it into a normalized table with a question on each row and feature in each column.
+
+
+
 ```{r}
 library(tidyverse)
 require(dplyr)
@@ -13,6 +19,25 @@ library(tidyr)
 #zoo is only needed for the index function
 library(zoo)
 ```
+
+# Limitations of Data
+
+- No way to filter out questions which I have already seen.  If I had the question ID from adapt itself I could calculate the number of times that I've seen a question.
+
+- Unable to find the order in which the questions were answered.  The `answer ordinal` value is the order in which the question appeared on the generated exam.
+
+#OTHER FEATURES TO TEST
+  
+#Num quizzes or exams since last exam
+#location
+#remaining time on exam
+#total exam minutes in last 24 hours
+#Number of quiz questions since last exam
+#daylight adjusted time to approx brightness of day outside
+#difficulty relative to earned level (diff/EL maybe?)
+#some other type of adjusted difficulty
+
+#Be able to filter out quizzes that you have not completed.  For example, look at the number of NA's in correct to see if the exam was really finished...
 
 ```{r}
 EL_raw = read_csv("Earned Level.csv")
@@ -46,13 +71,15 @@ adapt_raw = read_csv("Adapt Question List.csv", na = c("NULL", "")) %>%
 condense_line_items = function(cur_col){
   ifelse(length(unique(cur_col)) == 1, 
          yes = cur_col[1],
-         no = paste(cur_col, collapse = "|"))
+         no = paste(cur_col, collapse = "_"))
 }
 
 adapt = adapt_raw %>%
-  group_by(questionID) %>%
   #Fix the line item duplicates problem
+  group_by(questionID) %>%
   summarise_all(condense_line_items) %>%
+  
+  #Clean exhisting features
   transmute( questionID = questionID,
              course = Course,
              exam_type = as.factor(ifelse(`1 Full Exam 2 quiz` == 1,
@@ -64,36 +91,60 @@ adapt = adapt_raw %>%
              creation_dt = ymd(substr(start = 1, stop = 10, creation_dt_time)),
              examID = paste(course, as.character(creation_dt_time), sep = ""),
              weekday = as.factor(weekdays(creation_dt_time)),
+             #questions are marked if the Adapt user clicked "Marked" on the question
              marked = as.factor(Marked),
              minutes_used = as.numeric(`Seconds Used`)/60,
              correct = as.factor(Correct),
+             #there were two exams which started counting question numbers at 0.  These are converted to start at 1
+             #question ordinal is the number in which it appeared (e.g., the first question = ordinal 1, second = ordinal 2, etc).
+             #This can be vastly different than the number in which the user answered the question.
              q_ordinal = ifelse( examID %in% c("P2016-08-25 11:13:45", "P2016-08-24 14:48:06"), 
                                yes = `Question Ordinal` + 1,
                                no = `Question Ordinal`),
-             #there were two exams which started counting question numbers at 0.  These are converted to start at 1
              a_ordinal = ifelse( examID %in% c("P2016-08-25 11:13:45", "P2016-08-24 14:48:06"), 
                                yes = `Answer Ordinal` + 1,
                                no = `Answer Ordinal`),
              difficulty = Difficulty,
-             section_minor = as.factor(`Minor section`),
-             section_major = as.factor(`Major section`)
+             section_minor = `Minor section`,
+             section_major = `Major section`
           ) %>%
-  #Count the exams 
+  #Exam aggregate features
   arrange(desc(creation_dt_time)) %>%
   group_by(exam_type, course) %>%
+  #count the exams 
   mutate(nth_exam = dense_rank(creation_dt_time)) %>%
   ungroup() %>%
   group_by(course) %>%
   mutate(nth_e_or_q = dense_rank(creation_dt_time)) %>%
   ungroup() %>%
-
-  #Calculate exam aggregate statistics
   group_by(course, exam_type, nth_exam) %>%
+  #calculate total exam time, total number of questions, etc
   mutate(total_exam_time = sum(as.numeric(minutes_used)),
          num_questions = n(),
-         total_correct = sum(as.numeric(correct)),
-         exceed_time_limit = (exam_type == "e" && total_exam_time > 3.01*60))
+         exceed_time_limit = (exam_type == "e" && total_exam_time > 3.01*60)) %>%
+  
+  #Exam-specific, question-level features
+  group_by(course, exam_type, nth_exam) %>%
+  arrange(desc(q_ordinal)) %>%
+  mutate(approx_remaining_time = total_exam_time - cumsum(minutes_used)) %>%
+  ungroup() %>%
+  
+  #split topics and subtopics into their own columns
+  separate(col = section_minor,
+           into = c("subcat1", "subcat2", "subcat3"),
+           sep = "_",
+           extra = "drop",
+           fill = "right") %>%
+
+  separate(col = section_major,
+           into = c("cat1", "cat2", "cat3"),
+           sep = "_",
+           extra = "drop",
+           fill = "right") 
+  
 ```
+
+`approx_remaining_time` won't be perfect because I often skip problems.  The ordinal is the order in which the question appeared, or was generated, and not the order which I answered it.  The column "Answer Ordinal" attempts to fix this but does not make sense as it goes up above 35, to like 175.  This was a limitation to the data.
 
 Find the hours since the previous quiz or exam
 ```{r}
@@ -136,43 +187,19 @@ last_e_df = adapt %>%
 ```{r}
 final_adapt_df = adapt %>% 
   left_join(EL, by = c("creation_dt"), copy = F) %>%
-  select(#- creation_dt_time.y,
-         - course.y) %>%
-  #mutate(#examID = examID.x,
-        # course = course.x,
-        # creation_dt_time = creation_dt_time.x) %>%
+  select(- course.y) %>%
   left_join(last_e_or_q_df, by = c("examID"), copy = F) %>%
-  left_join(last_e_df, by = c("examID"), copy = F) 
+  left_join(last_e_df, by = c("examID"), copy = F) %>%
+  mutate(course = course.x) %>%
+  #change the order in which the columns appear
+  select(questionID, examID, course, exam_type, creation_dt_time, creation_dt, correct, marked, q_ordinal, difficulty, nth_exam, nth_e_or_q, weekday, everything())
 ```
 
-
-
+#Export the data set to a csv file
 ```{r}
-#%>%
-  #group_by(course, exam_type, nth_exam) %>%
-  #Remaining Time won't be perfect because I often skip problems.  The ordinal is the order in which the question appeared, or was generated, and not the order which I answered it.  The column "Answer Ordinal" attempts to fix this but does not make sense as it goes up above 35, to like 175
-  #Check with Ben before considering these to be valid
-  # arrange(desc(q_ordinal)) %>%
-  # mutate(remaining_time = total_exam_time - cumsum(minutes_used)) 
+#R data frame
 
-
-#OTHER FEATURES TO TEST
-  
-#Num quizzes or exams since last exam
-#location
-#remaining time on exam
-#total exam minutes in last 24 hours
-#Number of quiz questions since last exam
-#daylight adjusted time to approx brightness of day outside
-#difficulty relative to earned level (diff/EL maybe?)
-#some other type of adjusted difficulty
-
-#Be able to filter out quizzes that you have not completed.  For example, look at the number of NA's in correct to see if the exam was really finished...
-
-#Create new category features such as cat1, cat2, etc which hold the question topic and subtopic.  For instance, binomial trees, gamma functions, immunization, etc.
-```
-#Export file for Tableau
-```{r}
+#file for Tableau
 write_csv(final_adapt_df, "adapt_R_extract.csv")
 ```
 
