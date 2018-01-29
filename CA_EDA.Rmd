@@ -1,0 +1,380 @@
+---
+title: "CA_EDA"
+author: "Sam Castillo"
+date: "January 22, 2018"
+output: html_document
+---
+
+```{r global_options, warning= F, message= F}
+require(lubridate)
+library(expandFunctions)#remove annoying warnings with reset.warnings()
+library(tidyr)
+library(randomForest)
+library(caret)
+library(e1071)
+library(ROCR)
+library(pROC)
+library(pdp)
+library(AppliedPredictiveModeling)
+library(gapminder)
+library(mice)
+library(tidyverse)#always load last
+```
+
+```{r}
+load("adapt_clean.Rda")
+```
+
+# Feature Engineering
+
+## Missingness
+
+For models to run correctly, there cannot be missing values. 
+
+```{r}
+final_adapt.df %>% 
+  mutate(cat1 = ifelse(is.na(cat1), yes = subcat1, no = cat1)) %>%
+  select(contains("cat")) %>%
+  summarise_all(function(dat){sum(is.na(dat))})
+
+#does this impute the mean without removing the outliers first?  
+impute.mean <- function(x) replace(x, is.na(x) | is.nan(x) | is.infinite(x), mean(x, na.rm = TRUE))
+impute.zero <- function(x) replace(x, is.na(x) | is.nan(x) | is.infinite(x), 0)
+
+#Important note: when I was early on in practicing, I would leave questions NA intentionally instead of guessing.  As I got closer to exam time, I would guess.  For this reason, I choose to replace all NA values in correct with FALSE
+
+model.df = final_adapt.df %>%
+  filter(exam_type == "e",
+         minutes_used < 30) %>%
+  mutate(correct = as.factor(ifelse(is.na(correct), F, correct)),
+         cat1 = ifelse(is.na(cat1), yes = subcat1, no = cat1),
+         hrs_since_previous_e_or_q = impute.mean(hrs_since_previous_e_or_q),
+         q_ordinal = as.factor(q_ordinal),
+         nth_exam = as.factor(nth_exam),
+         cat1 = as.factor(cat1),
+         #subcat1 = as.factor(subcat1),
+         hrs_since_previous_e_or_q = as.double(hrs_since_previous_e_or_q),
+         minutes_used = ifelse(is.na(minutes_used), yes = 0, no = minutes_used),
+         approx_remaining_time = impute.mean(approx_remaining_time)) %>%
+  #add new features
+  mutate(rel_difficulty = difficulty - EL_begin,
+         cats = as.list(cat1, cat2, cat3),
+         subcats = as.list(subcat1, subcat2, subcat3))
+
+p = model.df %>% filter(course == "P") 
+fm = model.df %>% filter(course == "FM") 
+mfe = model.df %>% filter(course == "MFE") 
+```
+
+## Familiarity Scores
+
+## Idea
+
+- instead of just a count for each question, use a similarity measure between the cat and subcat vectors for each question.
+
+
+
+
+The below code requires going outside of `dplyr` and using a for loop.
+
+#Just USE A CUMSUM window function...
+
+```{r}
+history.df = final_adapt.df %>%
+  transmute(cur_examID = examID,
+            cur_creation_dt_time = creation_dt_time,
+            cur_cat1 = cat1,
+            cur_cat2 = cat2, 
+            cur_cat3 = cat3,
+            cur_subcat1 = subcat1,
+            cur_subcat2 = subcat2,
+            cur_subcat3 = subcat3)
+
+
+model.df %>%
+  transmute(
+    cat_fam = filter(.data = history.df, creation_dt_time < cur_creation_dt_time ) %>%
+      summarise(n = n()) %>%
+      as.numeric()
+  )
+
+#These should each be scaled by the exam
+get_cat_fam = function(cur_creation_dt_time, cur_cat){
+  final_adapt.df %>%
+    group_by(examID) %>%
+    filter(creation_dt_time < cur_creation_dt_time, !is.na(cat1), cat1 == cur_cat  | cat2 == cur_cat | cat3 == cur_cat) %>% 
+    summarise(out = n()) %>%
+  as.numeric()
+}
+
+percent_na = function(cur_col){
+  sum(is.na(cur_col))/length(cur_col)
+}
+
+final_adapt.df %>%
+  select(creation_dt_time, contains("cat")) %>%
+  summarise_all(percent_na)
+```
+
+```{r}
+
+get_subcat_fam = function(cur_creation_dt_time, cur_subcat){
+  final_adapt.df %>%
+    filter(creation_dt_time < cur_creation_dt_time, !is.na(subcat1), subcat1 == cur_subcat  | subcat2 == cur_subcat | subcat3 == cur_subcat) %>% 
+    summarise(out = n()) %>%
+  as.numeric()
+}
+
+get_cat_fam_diff = function(cur_creation_dt_time, cur_cat){
+  final_adapt.df %>%
+    filter(creation_dt_time < cur_creation_dt_time, !is.na(cat1), cat1 == cur_cat  | cat2 == cur_cat | cat3 == cur_cat) %>% 
+    summarise(out = sum(difficulty*correct)/n()) %>%
+  as.numeric()
+}
+
+get_subcat_fam_diff = function(cur_creation_dt_time, cur_subcat){
+  final_adapt.df %>%
+    filter(creation_dt_time < cur_creation_dt_time, correct == "1", !is.na(subcat1), subcat1 == cur_subcat  | subcat2 == cur_subcat | subcat3 == cur_subcat) %>% 
+    summarise(out = sum(difficulty*correct)/n()) %>%
+  as.numeric()
+}
+
+input.df = model.df %>%
+  select(contains("cat"), creation_dt_time)
+
+#what agony: a for loop in R
+for(i in 1:nrow(input.df)){
+  model.df$cat_fam[i] = get_cat_fam(input.df$creation_dt_time[i], input.df$cat1[i])
+  model.df$subcat_fam[i] = get_subcat_fam(input.df$creation_dt_time[i], input.df$subcat1[i])
+  model.df$cat_fam_diff[i] = get_cat_fam_diff(input.df$creation_dt_time[i], input.df$cat1[i])
+  model.df$subcat_fam_diff[i] = get_subcat_fam_diff(input.df$creation_dt_time[i], input.df$subcat1[i])
+  }
+
+```
+
+#Visualizations
+
+```{r}
+featurePlot.df = p %>%
+  filter(minutes_used < 30)
+
+x_features = featurePlot.df %>%
+  dplyr::select(nth_exam, rel_difficulty, minutes_used, q_ordinal)
+
+transparentTheme(trans = 0.4)
+
+featurePlot(x = x_features,
+            y = featurePlot.df$correct,
+            plot = "pairs", 
+            auto.key = list(columns = 2))
+```
+```{r}
+x_features = featurePlot.df %>%
+  dplyr::select( approx_remaining_time, cat_fam_diff, subcat_fam_diff, cat_fam, subcat_fam)
+           
+transparentTheme(trans = .9)
+
+featurePlot(x = x_features, 
+            y = featurePlot.df$correct,
+            plot = "density", 
+            ## Pass in options to xyplot() to 
+            ## make it prettier
+             scales = list(x = list(relation="free"), 
+                           y = list(relation="free")), 
+             adjust = 1.5, 
+              pch = "|", 
+              # layout = c(4, 2), 
+            auto.key = list(columns = 2)
+            )
+```
+
+```{r}
+x_features = featurePlot.df %>%
+  dplyr::select( nth_exam, rel_difficulty, minutes_used, q_ordinal, EL_change, hrs_since_previous_e, weekday,hrs_since_previous_e_or_q, creation_hr, marked) %>%
+  mutate(nth_exam = as.numeric(nth_exam),
+         q_ordinal = as.numeric(q_ordinal),
+         #monday = 1, tuesday = 2, etc
+         weekday = match(weekday, unique(featurePlot.df$weekday)) + 4)
+           
+transparentTheme(trans = .9)
+
+featurePlot(x = x_features, 
+            y = featurePlot.df$correct,
+            plot = "density", 
+            ## Pass in options to xyplot() to 
+            ## make it prettier
+             scales = list(x = list(relation="free"), 
+                           y = list(relation="free")), 
+             adjust = 1.5, 
+              pch = "|", 
+              layout = c(4, 2), 
+            auto.key = list(columns = 2)
+            )
+```
+
+#Modeling overview
+
+The performance metric is the area under the curve (AUC).
+
+Train/test split:
+
+
+#Logit model
+
+ - 70% accuracy without using quizz data directly, earned level, or category data
+
+
+```{r}
+f1 = correct ~ difficulty + minutes_used
+# define training control
+train_control<- trainControl(method="cv", number=10)
+# train the model 
+logit1<- train(f1, data = p, trControl=train_control, method="glm", family=binomial())
+
+#+ minutes_used + marked + 
+f2 = correct ~ nth_e_or_q + minutes_used + marked 
+# train the model 
+logit2 <- train(f2, data = p, trControl = train_control, method="glm", family=binomial())
+summary(logit2)
+```
+
+
+```{r}
+#slightly better than random guessing
+predictor = as.numeric(predict.train(logit1))
+response = as.numeric(p$correct)
+roc(response, predictor)
+confusionMatrix(response, predictor)
+```
+```{r}
+predictor = as.numeric(predict.train(logit2))
+response = as.numeric(p$correct)
+roc(response, predictor)
+confusionMatrix(response, predictor)
+```
+
+
+```{r}
+predictor = rf2$finalModel$votes[,1]
+response = rf.data$correct
+roc(response, predictor, percent=TRUE,
+            # arguments for auc
+            plot=TRUE, 
+            auc.polygon=TRUE, 
+            max.auc.polygon=TRUE, 
+            grid=TRUE,
+            print.auc=TRUE, 
+            show.thres=TRUE)
+```
+
+
+
+#Neural Network
+
+#SVM
+
+```{r}
+svm1 = svm(correct~., data = rf.data)
+
+svm1
+```
+
+
+#Random Forest 
+```{r}
+rf.data =  model.df %>%
+  filter(course =="MFE", exam_type =="e") %>%
+  #nth_exam dropped bacause it has more than 53 levels which does not work with randomForest packege.  This is what caret passes the train arguments to.
+  select(correct, marked, q_ordinal, difficulty, nth_exam,nth_e_or_q, weekday, creation_hr,minutes_used, cat1, approx_remaining_time, EL_change,EL_begin, EL_end, hrs_since_previous_e_or_q, hrs_since_previous_e, cat_fam, subcat_fam, cat_fam_diff, subcat_fam_diff )
+
+rf.data %>% summarise_all(function(dat){sum(is.na(dat)|is.nan(dat)|is.infinite(dat))})
+
+rf.data %>% summarise_all(function(dat){length(levels(dat))})
+
+#rf.data$nth_exam = rf.data$nth_exam %>% droplevels()
+
+#levels(rf.data$nth_exam) = as.character(unique(rf.data$nth_exam))
+  
+```
+```{r}
+x = rf.data %>% select(-correct) 
+y = rf.data %>% select(correct) %>%
+  unlist() %>%
+  as.factor()
+```
+
+```{r}
+t1 = Sys.time()
+# Create model with default paramters
+control <- trainControl(method = "repeatedcv", number=10, repeats=3)
+seed <- 7
+metric <- "Kappa"
+set.seed(seed)
+mtry <- sqrt(ncol(rf.data))
+tunegrid <- expand.grid(.mtry=mtry)
+
+rf2 <- train(correct ~., data = rf.data, method="rf", metric=metric, tuneGrid=tunegrid, trControl=control)
+
+t2 = Sys.time()
+rf_runtime = t2 - t1
+rf_runtime
+```
+```{r}
+rf2
+```
+
+```{r}
+varImpPlot(rf2$finalModel)
+```
+```{r}
+predictor = rf2$finalModel$votes[,1]
+response = rf.data$correct
+roc(response, predictor, percent=TRUE,
+            # arguments for auc
+            plot=TRUE, 
+            auc.polygon=TRUE, 
+            max.auc.polygon=TRUE, 
+            grid=TRUE,
+            print.auc=TRUE, 
+            show.thres=TRUE)
+```
+
+
+
+```{r}
+partialPlot()
+```
+```{r}
+partialPlot(rf2$finalModel$forest, rf.data, "nth_exam")
+```
+```{r}
+partialPlot(rf2, rf.data, "minutes_used")
+```
+# Extension to New Data from Quizzes
+
+Test different time allocation patterns and try to maximize the total number of correct questions.
+
+#What features will be different
+- Correct will now be a predicted value
+- Minutes_used will now be assigned by a rule.  This will be the quantity to maximize over.
+- Marked will need to be filled intelligently or not used
+- nth_exam can be fixed in the range of 8-10
+- weekday can be bootstrapped (or should each simulated exam be on the same day?)
+- creation_hr can be bootstrapped
+
+#What Features will Stay the Same
+- q_ordinal can be generated as it is random
+- difficulty is the same
+- nth_e_or_q can be fixed
+- cat1 is already fixed
+- approx_remaining_time will be determined by the rule
+- EL variables can stay the same
+- hrs_since_previous can stay the same
+
+```{r}
+quiz.df = model.df %>%
+  filter(exam_type == "q") %>%
+  select(correct, marked, q_ordinal, difficulty, nth_exam, nth_e_or_q, weekday, creation_hr,minutes_used, cat1, approx_remaining_time, EL_change,EL_begin, EL_end, hrs_since_previous_e_or_q, hrs_since_previous_e ) %>%
+  as.data.frame()
+```
+
