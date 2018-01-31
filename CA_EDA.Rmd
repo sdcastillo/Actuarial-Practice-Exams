@@ -7,17 +7,15 @@ output: html_document
 
 ```{r global_options, warning= F, message= F}
 require(lubridate)
-library(expandFunctions)#remove annoying warnings with reset.warnings()
 library(tidyr)
 library(randomForest)
-library(caret)
 library(e1071)
 library(ROCR)
 library(pROC)
 library(pdp)
 library(AppliedPredictiveModeling)
-library(gapminder)
 library(mice)
+library(caret)
 library(tidyverse)#always load last
 ```
 
@@ -27,155 +25,151 @@ load("adapt_clean.Rda")
 
 # Feature Engineering
 
-## Missingness
+## Missingnes
+
+##Historical Experience
+
+Second attempt using `dplyr`.
+
+```{r}
+#re-write these using a function
+
+#not perfect because it counts problems in then-current exam
+#this looks back across exams and quizzes
+final_adapt.df = final_adapt.df %>%
+  group_by(cat1) %>%
+  #features for historical major section category 1
+  arrange(desc(creation_dt_time)) %>%
+  mutate(temp_hist_n_cat1 = ifelse(is.na(cat1), yes = 0, no = cumsum(!is.na(correct)))) %>%
+  group_by(cat2) %>%
+  #features for historical major section category 1
+  arrange(desc(creation_dt_time)) %>%
+  mutate(temp_hist_n_cat2 = ifelse(is.na(cat2), yes = 0, no = cumsum(!is.na(correct)))) %>%
+  group_by(cat3) %>%
+  #features for historical major section category 1
+  arrange(desc(creation_dt_time)) %>%
+  mutate(temp_hist_n_cat3 = ifelse(is.na(cat3), yes = 0, no = cumsum(!is.na(correct)))) %>%
+  #historical features
+  mutate(hist_n_cat = temp_hist_n_cat1 + temp_hist_n_cat2 + temp_hist_n_cat3) %>%
+  select(-contains("temp")) %>%
+  ungroup()
+```
+
+Third attempt using general `apply` functions.
+
+```{r}
+suppressMessages({
+long.df = final_adapt.df %>%
+  gather(key = cat_key, value = cat, cat1:cat3, na.rm = T, factor_key = T) %>%
+  gather(key = subcat_key, value = subcat, subcat1:subcat3,  na.rm = T, factor_key = T) 
+})
+
+get_history = function(examID, creation_dt_time, cat1, cat2, cat3, subcat1, subcat2, subcat3){
+  
+  cur_examID = examID
+  cur_dt_time = creation_dt_time
+  cur_cat = unlist(list(cat1, cat2, cat3))
+  cur_subcat = unlist(list(subcat1, subcat2, subcat3))
+
+ lookback.list = long.df %>%
+   filter(examID != cur_examID, creation_dt_time < cur_dt_time) %>%
+   summarise(#categories
+             hist_cat_n = sum(ifelse( cat %in% cur_cat, yes = 1, no = 0)),
+             hist_cat_ncorrect = sum(ifelse( correct == T & cat %in% cur_cat, yes = 1, no = 0), na.rm = T),
+             hist_cat_diff = sum(ifelse( cat %in% cur_cat, yes = difficulty, no = 0)),
+             hist_cat_diff_correct = sum(ifelse( correct == T & cat %in% cur_cat, yes = difficulty, no = 0), na.rm = T),
+             #subcategories
+             hist_subcat_n = sum(ifelse( subcat %in% cur_subcat, yes = 1, no = 0)),
+             hist_subcat_ncorrect = sum(ifelse( correct == T & subcat %in% cur_subcat, yes = 1, no = 0), na.rm = T),
+             hist_subcat_diff = sum(ifelse( subcat %in% cur_subcat, yes = difficulty, no = 0)),
+             hist_subcat_diff_correct = sum(ifelse( correct == T & subcat %in% cur_subcat, yes = difficulty, no = 0), na.rm = T)) %>%
+   list()
+
+  lookback.list 
+}
+
+#test case
+#get_history(final_adapt.df %>% arrange(creation_dt_time) %>% slice(1705)) 
+
+t1 = Sys.time()
+completed.df = final_adapt.df %>%
+  rowwise() %>%
+  mutate(examID = examID,
+            hist.list = get_history(examID, creation_dt_time, cat1, cat2, cat3, subcat1, subcat2, subcat3),
+            hist_cat_n = hist.list[[1]],
+            hist_cat_ncorrect = hist.list[[2]],
+            hist_cat_diff = hist.list[[3]],
+            hist_cat_diff_correct = hist.list[[4]],
+            hist_subcat_n = hist.list[[5]],
+            hist_subcat_ncorrect = hist.list[[6]],
+            hist_subcat_diff = hist.list[[7]],
+            hist_subcat_diff_correct = hist.list[[8]]) %>%
+  select(-hist.list)
+t2 = Sys.time()
+t2 - t1
+```
+
 
 For models to run correctly, there cannot be missing values. 
 
 ```{r}
-final_adapt.df %>% 
-  mutate(cat1 = ifelse(is.na(cat1), yes = subcat1, no = cat1)) %>%
-  select(contains("cat")) %>%
-  summarise_all(function(dat){sum(is.na(dat))})
-
 #does this impute the mean without removing the outliers first?  
 impute.mean <- function(x) replace(x, is.na(x) | is.nan(x) | is.infinite(x), mean(x, na.rm = TRUE))
 impute.zero <- function(x) replace(x, is.na(x) | is.nan(x) | is.infinite(x), 0)
+impute.false = function(x) replace(x, is.na(x) | is.nan(x) | is.infinite(x), 'FALSE')
 
 #Important note: when I was early on in practicing, I would leave questions NA intentionally instead of guessing.  As I got closer to exam time, I would guess.  For this reason, I choose to replace all NA values in correct with FALSE
 
-model.df = final_adapt.df %>%
+
+model.df = completed.df %>%
   filter(exam_type == "e",
          minutes_used < 30) %>%
-  mutate(correct = as.factor(ifelse(is.na(correct), F, correct)),
-         cat1 = ifelse(is.na(cat1), yes = subcat1, no = cat1),
+  mutate(cat1 = ifelse(is.na(cat1), yes = cat2, no = cat1),
          hrs_since_previous_e_or_q = impute.mean(hrs_since_previous_e_or_q),
-         q_ordinal = as.factor(q_ordinal),
-         nth_exam = as.factor(nth_exam),
-         cat1 = as.factor(cat1),
-         #subcat1 = as.factor(subcat1),
-         hrs_since_previous_e_or_q = as.double(hrs_since_previous_e_or_q),
+         #not ideal; only temporary &&&&&&&&&&
          minutes_used = ifelse(is.na(minutes_used), yes = 0, no = minutes_used),
-         approx_remaining_time = impute.mean(approx_remaining_time)) %>%
-  #add new features
-  mutate(rel_difficulty = difficulty - EL_begin,
-         cats = as.list(cat1, cat2, cat3),
-         subcats = as.list(subcat1, subcat2, subcat3))
+         approx_remaining_time = impute.mean(approx_remaining_time),
+         correct = as.logical(correct)) %>%
+         mutate(correct = ifelse(is.na(correct) | is.nan(correct) , yes = F, no = correct))
+
+#weird glitch with dplyr
+model.df$correct = as.factor(model.df$correct)
 
 p = model.df %>% filter(course == "P") 
 fm = model.df %>% filter(course == "FM") 
 mfe = model.df %>% filter(course == "MFE") 
 ```
 
-## Familiarity Scores
-
-## Idea
-
-- instead of just a count for each question, use a similarity measure between the cat and subcat vectors for each question.
-
-
-
-
-The below code requires going outside of `dplyr` and using a for loop.
-
-#Just USE A CUMSUM window function...
-
-```{r}
-history.df = final_adapt.df %>%
-  transmute(cur_examID = examID,
-            cur_creation_dt_time = creation_dt_time,
-            cur_cat1 = cat1,
-            cur_cat2 = cat2, 
-            cur_cat3 = cat3,
-            cur_subcat1 = subcat1,
-            cur_subcat2 = subcat2,
-            cur_subcat3 = subcat3)
-
-
-model.df %>%
-  transmute(
-    cat_fam = filter(.data = history.df, creation_dt_time < cur_creation_dt_time ) %>%
-      summarise(n = n()) %>%
-      as.numeric()
-  )
-
-#These should each be scaled by the exam
-get_cat_fam = function(cur_creation_dt_time, cur_cat){
-  final_adapt.df %>%
-    group_by(examID) %>%
-    filter(creation_dt_time < cur_creation_dt_time, !is.na(cat1), cat1 == cur_cat  | cat2 == cur_cat | cat3 == cur_cat) %>% 
-    summarise(out = n()) %>%
-  as.numeric()
-}
-
-percent_na = function(cur_col){
-  sum(is.na(cur_col))/length(cur_col)
-}
-
-final_adapt.df %>%
-  select(creation_dt_time, contains("cat")) %>%
-  summarise_all(percent_na)
-```
-
-```{r}
-
-get_subcat_fam = function(cur_creation_dt_time, cur_subcat){
-  final_adapt.df %>%
-    filter(creation_dt_time < cur_creation_dt_time, !is.na(subcat1), subcat1 == cur_subcat  | subcat2 == cur_subcat | subcat3 == cur_subcat) %>% 
-    summarise(out = n()) %>%
-  as.numeric()
-}
-
-get_cat_fam_diff = function(cur_creation_dt_time, cur_cat){
-  final_adapt.df %>%
-    filter(creation_dt_time < cur_creation_dt_time, !is.na(cat1), cat1 == cur_cat  | cat2 == cur_cat | cat3 == cur_cat) %>% 
-    summarise(out = sum(difficulty*correct)/n()) %>%
-  as.numeric()
-}
-
-get_subcat_fam_diff = function(cur_creation_dt_time, cur_subcat){
-  final_adapt.df %>%
-    filter(creation_dt_time < cur_creation_dt_time, correct == "1", !is.na(subcat1), subcat1 == cur_subcat  | subcat2 == cur_subcat | subcat3 == cur_subcat) %>% 
-    summarise(out = sum(difficulty*correct)/n()) %>%
-  as.numeric()
-}
-
-input.df = model.df %>%
-  select(contains("cat"), creation_dt_time)
-
-#what agony: a for loop in R
-for(i in 1:nrow(input.df)){
-  model.df$cat_fam[i] = get_cat_fam(input.df$creation_dt_time[i], input.df$cat1[i])
-  model.df$subcat_fam[i] = get_subcat_fam(input.df$creation_dt_time[i], input.df$subcat1[i])
-  model.df$cat_fam_diff[i] = get_cat_fam_diff(input.df$creation_dt_time[i], input.df$cat1[i])
-  model.df$subcat_fam_diff[i] = get_subcat_fam_diff(input.df$creation_dt_time[i], input.df$subcat1[i])
-  }
-
-```
-
 #Visualizations
 
 ```{r}
-featurePlot.df = p %>%
-  filter(minutes_used < 30)
-
-x_features = featurePlot.df %>%
-  dplyr::select(nth_exam, rel_difficulty, minutes_used, q_ordinal)
-
-transparentTheme(trans = 0.4)
-
-featurePlot(x = x_features,
-            y = featurePlot.df$correct,
-            plot = "pairs", 
+x_features = fm %>%
+  dplyr::select(difficulty, minutes_used, nth_exam, q_ordinal)
+transparentTheme(trans = .9)
+caret::featurePlot(x = x_features,
+            y = fm$correct,
+            plot = "pairs",
             auto.key = list(columns = 2))
+
 ```
 ```{r}
-x_features = featurePlot.df %>%
-  dplyr::select( approx_remaining_time, cat_fam_diff, subcat_fam_diff, cat_fam, subcat_fam)
-           
+new_x_features = fm %>%
+  dplyr::select(difficulty, contains("hist_subcat"))
+
 transparentTheme(trans = .9)
 
-featurePlot(x = x_features, 
-            y = featurePlot.df$correct,
+caret::featurePlot(x = new_x_features,
+            y = fm$correct,
+            plot = "pairs",
+            auto.key = list(columns = 2))
+```
+
+
+```{r}
+transparentTheme(trans = .9)
+
+featurePlot(x = new_x_features, 
+            y = fm$correct,
             plot = "density", 
             ## Pass in options to xyplot() to 
             ## make it prettier
@@ -194,6 +188,7 @@ x_features = featurePlot.df %>%
   mutate(nth_exam = as.numeric(nth_exam),
          q_ordinal = as.numeric(q_ordinal),
          #monday = 1, tuesday = 2, etc
+         #convert to numeric
          weekday = match(weekday, unique(featurePlot.df$weekday)) + 4)
            
 transparentTheme(trans = .9)
@@ -231,11 +226,15 @@ train_control<- trainControl(method="cv", number=10)
 # train the model 
 logit1<- train(f1, data = p, trControl=train_control, method="glm", family=binomial())
 
-#+ minutes_used + marked + 
-f2 = correct ~ nth_e_or_q + minutes_used + marked 
+f2 = correct ~ nth_e_or_q + minutes_used  
 # train the model 
 logit2 <- train(f2, data = p, trControl = train_control, method="glm", family=binomial())
 summary(logit2)
+
+f3 = correct ~ nth_e_or_q + minutes_used + hist_n_subcat
+# train the model 
+logit3 <- train(f3, data = p, trControl = train_control, method="glm", family=binomial())
+summary(logit3)
 ```
 
 
@@ -252,20 +251,14 @@ response = as.numeric(p$correct)
 roc(response, predictor)
 confusionMatrix(response, predictor)
 ```
-
-
 ```{r}
-predictor = rf2$finalModel$votes[,1]
-response = rf.data$correct
-roc(response, predictor, percent=TRUE,
-            # arguments for auc
-            plot=TRUE, 
-            auc.polygon=TRUE, 
-            max.auc.polygon=TRUE, 
-            grid=TRUE,
-            print.auc=TRUE, 
-            show.thres=TRUE)
+predictor = as.numeric(predict.train(logit3))
+response = as.numeric(p$correct)
+roc(response, predictor)
+confusionMatrix(response, predictor)
 ```
+
+
 
 
 
@@ -282,74 +275,69 @@ svm1
 
 #Random Forest 
 ```{r}
-rf.data =  model.df %>%
-  filter(course =="MFE", exam_type =="e") %>%
-  #nth_exam dropped bacause it has more than 53 levels which does not work with randomForest packege.  This is what caret passes the train arguments to.
-  select(correct, marked, q_ordinal, difficulty, nth_exam,nth_e_or_q, weekday, creation_hr,minutes_used, cat1, approx_remaining_time, EL_change,EL_begin, EL_end, hrs_since_previous_e_or_q, hrs_since_previous_e, cat_fam, subcat_fam, cat_fam_diff, subcat_fam_diff )
+rf.data = model.df %>% 
+  filter(course == "FM") %>%
+  select(correct, q_ordinal, difficulty, nth_exam,nth_e_or_q, weekday, creation_hr,minutes_used, approx_remaining_time, EL_change,EL_begin, EL_end, hrs_since_previous_e, contains("hist"))%>%
+  ungroup() 
 
+rf.data.validation = model.df %>% 
+  filter(course == "P") %>%
+  select(correct, q_ordinal, difficulty, nth_exam,nth_e_or_q, weekday, creation_hr,minutes_used, approx_remaining_time, EL_change,EL_begin, EL_end,  hrs_since_previous_e, contains("hist"))%>%
+  ungroup() 
+```
+
+```{r}
 rf.data %>% summarise_all(function(dat){sum(is.na(dat)|is.nan(dat)|is.infinite(dat))})
-
 rf.data %>% summarise_all(function(dat){length(levels(dat))})
-
-#rf.data$nth_exam = rf.data$nth_exam %>% droplevels()
-
-#levels(rf.data$nth_exam) = as.character(unique(rf.data$nth_exam))
-  
-```
-```{r}
-x = rf.data %>% select(-correct) 
-y = rf.data %>% select(correct) %>%
-  unlist() %>%
-  as.factor()
 ```
 
 ```{r}
-t1 = Sys.time()
 # Create model with default paramters
 control <- trainControl(method = "repeatedcv", number=10, repeats=3)
-seed <- 7
-metric <- "Kappa"
-set.seed(seed)
+seed <- 7; set.seed(seed)
+metric <- "Accuracy"
 mtry <- sqrt(ncol(rf.data))
 tunegrid <- expand.grid(.mtry=mtry)
 
-rf2 <- train(correct ~., data = rf.data, method="rf", metric=metric, tuneGrid=tunegrid, trControl=control)
+rf.default <- train(correct ~., data = rf.data, method="rf", metric=metric, tuneGrid=tunegrid, trControl=control)
 
-t2 = Sys.time()
-rf_runtime = t2 - t1
-rf_runtime
+
+#Without new features
+rf.data.old = rf.data %>% select(-contains("hist"))
+rf.old <- train(correct ~., data = rf.data, method="rf", metric=metric, tuneGrid=tunegrid, trControl=control)
+
 ```
 ```{r}
-rf2
+rf.default
 ```
 
 ```{r}
 varImpPlot(rf2$finalModel)
 ```
+
+
 ```{r}
-predictor = rf2$finalModel$votes[,1]
-response = rf.data$correct
-roc(response, predictor, percent=TRUE,
-            # arguments for auc
-            plot=TRUE, 
-            auc.polygon=TRUE, 
-            max.auc.polygon=TRUE, 
-            grid=TRUE,
-            print.auc=TRUE, 
-            show.thres=TRUE)
+#somehow this now works??  The documentation on roxygen is out of date
+predictor = as.numeric(predict.train(object = rf.default, new  = rf.data.validation[-1], unkOnly = T))
+
+label = as.numeric(rf.data.validation$correct)
+roc(label, predictor)
+confusionMatrix(predictor, label)
+```
+
+```{r}
+predictor = extractPrediction(rf.default,)
+label = as.numeric(y.validation)
+roc(response, predictor)
+confusionMatrix(predictor, label)
+
+
 ```
 
 
 
-```{r}
-partialPlot()
-```
-```{r}
-partialPlot(rf2$finalModel$forest, rf.data, "nth_exam")
-```
-```{r}
-partialPlot(rf2, rf.data, "minutes_used")
-```
+
+
 # Extension to New Data from Quizzes
 
 Test different time allocation patterns and try to maximize the total number of correct questions.
